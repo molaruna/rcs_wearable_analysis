@@ -9,8 +9,8 @@ Directory structure:
 ```bash
 ├── code
 ├── data
-│   └── RCS02
-│       └── L
+│   └── <subj_ID>
+│       └── <sidedness>
 │           ├── neural
 │           │   ├── coh
 │           │   └── psd

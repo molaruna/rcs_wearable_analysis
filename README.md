@@ -43,3 +43,4 @@ Neural spectral data are derived from the Summit RC+S neurostimulator (Medtronic
 ## License
 This software is open source and under an MIT license.
   
+# gamma_entrainment_task

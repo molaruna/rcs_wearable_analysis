@@ -5,7 +5,7 @@ to continuously decode motor signs using spectral features from chronic human br
 
 ## Getting started
 This code uses Python 3.8.3
-To use this code, run ``sync_data(<parent_dir>)`` in a parent directory with the dataset files you'd like to incorporate in the analysis.
+To use this code, run ``sync_data(<parent_dir>)`` in the parent directory that contains the datasets you'd like to incorporate in the analysis.
 
 
 ## Data

@@ -4,9 +4,7 @@ This code uses neural data that have been preprocessed using [rcs_lfp_analysis r
 into overlaid power spectra (details in [readme](https://github.com/molaruna/rcs_lfp_analysis/blob/main/README.md)) to continuously decode motor signs using spectral features from chronic human brain recordings collected using the Summit RC+S system, in addition to sensor wearable measures of motor signs. 
 
 ## Getting started
-This code uses Python 3.8.3. Currently, to run this analysis, download the [script]() and play around with the inputs.
-
-
+This code uses Python 3.8.3. Currently, to run this analysis, download the [script](https://github.com/molaruna/rcs_wearable_analysis/blob/main/code/sync_data.py) (and [helper functions](https://github.com/molaruna/rcs_wearable_analysis/blob/main/code/sync_funcs.py)) and play around. Modify `data_dir` to process different directories.
 
 ## Data
 Neural electrophysiological data are derived from the Summit RC+S neurostimulator (Medtronic). See the [rcs_lfp_analysis repo](https://github.com/molaruna/rcs_lfp_analysis) for more information. Wearable sensor data are derived from the PKG system and Apple watch. PKG data are available on [UCSF Box](https://ucsf.app.box.com/folder/0), and apple watch data are available on [Rune Labs](https://app.runelabs.io/patients). You can request access from me. Then, these data are organized within the repo directory structure. Specifically, these are the CSV file keywords that are used by the function:<br/>

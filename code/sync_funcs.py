@@ -12,17 +12,27 @@ import statsmodels.api as sm
 import scipy.stats as stat
 import xarray as xr
 from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import math
+from sklearn.preprocessing import scale
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, MaxAbsScaler, RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RepeatedKFold
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import GridSearchCV
 from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Lasso
+from sklearn.linear_model import LassoCV
+from sklearn.feature_selection import RFE
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 import torch.optim as optim
 from datetime import date
 import datetime
+from itertools import combinations
 
 
 def get_files(data_dir):
@@ -227,15 +237,109 @@ def merge_dfs(data_dir, feature_key, targets):
     if feature_key == 'spectra':
         feature_i = [j for j, s in enumerate(df_out.columns) if feature_key in s]    
         df_out.iloc[:, feature_i] = np.log10(df_out.iloc[:, feature_i])
-    
+        
     return df_out
 
-def scale_data(df, scaler_type):
+def convert_category(df, quantile_list):
+    targets = df.columns
+    df_quantiles = pd.DataFrame(index = quantile_list, columns = targets)
+    #log scale
+    df_cat = np.log10(df)
+    df_cat = df_cat.replace([-np.inf],0)
+    for i in range(len(targets)):
+        target = targets[i]
+        symps = df_cat[target][df_cat[target] != 0]
+        if target == 'pkg_bk':
+            symps = df_cat[target][df_cat[target] > 0.1] #remove negative bk scores
+        symps_norm = (symps-min(symps))/(max(symps)-min(symps))
+        df_quantiles[target] = symps_norm.quantile(quantile_list)
+
+    return df_quantiles
+    
+def plot_categories(df_norm, quantiles):
+    targets = df_norm.columns
+        
+    nplots = len(targets)
+    xlabel = 'Time (datetime)'
+
+    fig, axs = plt.subplots(nrows = nplots, ncols = 1, figsize=(15, 5*nplots))
+    plt.rcParams.update({'font.size': 16})    
+    plt.setp(axs[-1], xlabel = xlabel)
+    fig.text(0.007, 0.5, 'scores (normalized)', ha="center", va="center", rotation=90)
+    
+    fig.suptitle('20th percentile categories of symptoms')
+    
+    colors = ['#3976AF', '#F08536', '#519D3E', '#C63A32', '#8D6BB8', '#84584E', '#D57FBE', '#BDBC45', '#56BBCC']      
+    locs = ['upper right', 'center right', 'lower right']
+    for i in range(len(targets)):  
+        target = targets[i]
+        ax = fig.get_axes()[i]
+
+        ax.set_ylim([0, 1])
+        ax.set_title(target)
+
+        df = pd.DataFrame(df_norm[target])
+        x = df.index
+        
+        for j in range(len(df.columns)):
+            feature = df.columns[j]
+            ax.plot(x, df[feature], label = feature, color = colors[0], alpha = 0.8)
+            for k in range(quantiles.shape[0]):
+                ax.hlines(y = quantiles[target].iloc[k], 
+                           xmin = df.index[0], xmax = df.index[len(df)-1],
+                           color = colors[1])
+        ax.legend(ncol = 1, loc = 'upper right', prop={"size":10}, title = 'features')
+
+def continuous2ordinal(df_norm, quantiles):
+    targets = df_norm.columns
+    df_norm_ord = df_norm.copy()
+    for i in range(len(targets)):
+        target = targets[i]
+        df_norm_ord[target][df_norm[target] < quantiles[target].iloc[0]] = 0
+        df_norm_ord[target][(df_norm[target] > quantiles[target].iloc[0]) & 
+                            (df_norm[target] < quantiles[target].iloc[1])] = 1
+        df_norm_ord[target][(df_norm[target] > quantiles[target].iloc[1]) & 
+                            (df_norm[target] < quantiles[target].iloc[2])] = 2
+        df_norm_ord[target][(df_norm[target] > quantiles[target].iloc[2]) & 
+                            (df_norm[target] < quantiles[target].iloc[3])] = 3
+        df_norm_ord[target][(df_norm[target] > quantiles[target].iloc[3]) & 
+                            (df_norm[target] <= quantiles[target].iloc[4])] = 4
+
+    return df_norm_ord
+        
+def merge_dfs_time(x, y):
+    x.index.name = 'samples'
+    y.index.name = 'samples'
+
+    df_merged = x.merge(y, left_index = True, right_index = True)
+    df_merged = df_merged.dropna()
+    
+    return df_merged
+
+def scale_data(df, targets, std_thresh, scaler_type):
+    
+    
+    df.loc[:, targets] = df[((df[targets] - df[targets].median(axis=0)) / df[targets].std()).abs() < std_thresh]
+    
     scaler = get_scaler(scaler_type)
     df_scale = pd.DataFrame(data = scaler.fit_transform(df),
                             columns = df.columns,
                             index = df.index)
-    return df_scale
+    return df_scale 
+
+def scale_data_ch(da_psd, scaler_type):
+    da_psd_norm_ch = da_psd.copy()
+    contacts = da_psd.contact.to_numpy()
+    time_intervals = da_psd.time_interval.to_numpy()
+    for i in range(len(contacts)):
+        for j in range(len(time_intervals)):
+            df = da_psd.sel(time_interval = time_intervals[j]).sel(contact = contacts[i]).data
+            arr = df.flatten().reshape(-1, 1)
+            scaler = get_scaler(scaler_type)
+            arr_scale = scaler.fit_transform(arr)
+            df_scale = arr_scale.reshape(df.shape)
+            da_psd_norm_ch.loc[dict(time_interval = time_intervals[j])].loc[dict(contact = contacts[i])] = df_scale
+    return da_psd_norm_ch
 
 def get_scaler(scaler):
     scalers = {
@@ -330,6 +434,13 @@ def reshape_data(df, feature_key, targets, psd_only = False):
         da_redund.loc[dict(contact = contact)] = data_keep.values
     da = xr.concat([da, da_redund], dim='feature')
     return da
+
+def reshape_xr2df(da, colnames, time_interval):
+    data = da.sel(time_interval = time_interval).to_numpy().transpose(1,0,2).reshape(-1, 126*4)
+    df = pd.DataFrame(data = data, 
+                     columns = colnames,
+                     index = da.measure.to_numpy())
+    return df
 
 def get_single_meta_data(index, interval):
     df_variable = pd.DataFrame(columns = ['start_date', 
@@ -451,11 +562,75 @@ def get_psd_overlaps(df_times, target_list):
 
     return target_list
 
+def concat_feature2sample(df, nchannels):
+    ncols = int(df.shape[1]/nchannels)
+    index_labels = np.tile(df.index.to_numpy(), nchannels)
+
+    df_out = pd.DataFrame(columns = range(0, 126),
+                          index = index_labels)
+    
+    df_out.index.name = 'samples'
+    df_out.columns.name = 'features'
+    
+    i_start = 0
+    i_stop = df.shape[0]
+    
+    j_start = 0
+    j_stop = ncols
+
+    for i in range(nchannels):
+        df_out.iloc[i_start:i_stop, :] = df.iloc[:, j_start:j_stop]
+        i_start += df.shape[0]
+        i_stop += df.shape[0]
+        
+        j_start += ncols
+        j_stop += ncols
+    
+    return [df_out, get_contacts(df.columns)]
+
+def get_channels4samples(df_samples, channels):
+    nsamples = len(df_samples.index.unique())
+    data = np.empty(df_samples.shape[0], dtype = np.dtype('U100'))
+    
+    i_start = 0
+    i_stop = nsamples
+    
+    #ch_labels = {'+2-0' : 0,
+    #             '+3-1' : 0.33,
+    #             '+10-8' : 0.66,
+    #             '+11-9' : 1}
+    
+    for channel in channels:
+        data[i_start:i_stop] = channel
+        i_start += nsamples
+        i_stop += nsamples
+        
+    df = pd.DataFrame(data = data,
+                      index = df_samples.index,
+                      columns = ['channel'])
+    
+    return df
+
+def get_toppcs(da_pcaf_ch, df_pcaf, npcs):
+    da_pcaf = da_pcaf_ch.copy()
+
+    contacts = da_pcaf.contact.values
+
+    i_start = 0
+    i_stop = 126
+    
+    for i_ch in range(len(contacts)):
+        channel = contacts[i_ch]
+        da_pcaf.loc[dict(contact = channel)] = df_pcaf.iloc[0:npcs, i_start:i_stop].values
+        i_start += 126
+        i_stop += 126
+
+    return da_pcaf
 
 def compute_pca_2d(df, pca, pc_labels, domain):
     pcs = pca.fit_transform(df.values).T
     columns = df.index
-    if domain == 'frequency':
+    if domain == 'features':
         pcs = pca.fit_transform(df.T.values).T   
         columns = df.columns
 
@@ -469,7 +644,7 @@ def compute_pca(da_psd, ncomponents, domain):
     pc_labels = ['pc' + sub for sub in pc_nums]
     pca = PCA(n_components=ncomponents)
 
-    if domain == 'frequency':  
+    if domain == 'features':  
         da_psd = da_psd.sel(time_interval='min1')
         da = xr.DataArray(
                           dims = ['contact', 'pc', 'feature'], 
@@ -494,12 +669,126 @@ def compute_pca(da_psd, ncomponents, domain):
             da.loc[dict(contact=contact)] = df_pcs            
             df_pc_ratio.iloc[:, i] = pca.explained_variance_ratio_
 
-    elif domain == 'time':
+    elif domain == 'samples':
             df_pcs = compute_pca_2d(da_psd, pca, pc_labels, domain)
             da = df_pcs
             df_pc_ratio = pca.explained_variance_ratio_
 
     return [da, df_pc_ratio]
+    
+def get_pc_components(da_psd):
+    da_psd_sub = da_psd.sel(time_interval = 'min1')
+    contacts = da_psd.contact.to_numpy()
+    
+    X_sv = pd.DataFrame([], columns = contacts, index = np.arange(0, da_psd_sub.shape[2]))
+    vec_num_pcs = pd.DataFrame([], columns = contacts, index = [0])
+    for i in range(len(contacts)):
+        df_psd = da_psd_sub.sel(contact = contacts[i]).data
+        X_sv.iloc[:, i] = np.linalg.svd(df_psd, full_matrices = False)[1]
+        vec_num_pcs[contacts[i]] = 1/(np.sum(X_sv.iloc[:, i]**2)/np.sum(X_sv.iloc[:, i])**2)
+
+    X_sv.index.name = 'singular_values'
+    return [X_sv, vec_num_pcs]
+        
+def plot_pc_components(singular_values, vec_num_pcs):
+    plt.figure()
+    colors = ['#3976AF', '#F08536', '#519D3E', '#C63A32', '#8D6BB8', '#84584E', '#D57FBE', '#BDBC45', '#56BBCC']      
+    for i in range(singular_values.shape[1]):
+        plt.plot(np.log(singular_values.iloc[:, i]), 
+                 color = colors[i],
+                 label = singular_values.columns[i],
+                 alpha = 0.8)
+        plt.axvline(x=vec_num_pcs.iloc[0, i], color = colors[i], alpha = 0.5)
+    plt.legend()
+    plt.ylabel('log10(singular value)')
+    plt.xlabel('Vector #')
+    plt.title('Top singular values')
+ 
+def get_pca_energy(da_psd):
+    da_psd_sub = da_psd.sel(time_interval = 'min1')
+    contacts = da_psd.contact.to_numpy()
+    
+    X_uavar = pd.DataFrame([], columns = contacts, index = np.arange(0, da_psd_sub.shape[2]))
+    for i in range(len(contacts)):
+        df_psd = da_psd_sub.sel(contact = contacts[i]).data
+        uavar = np.linalg.svd(df_psd, full_matrices = False)[0]
+        X_uavar.iloc[:, i] = np.sum(np.square(uavar), axis = 0)
+        
+    X_uavar.index.name = 'unitary_array_toppcvar'
+    return X_uavar
+    
+def plot_pca_loading(pca_loading):
+    plt.figure()
+    colors = ['#3976AF', '#F08536', '#519D3E', '#C63A32', '#8D6BB8', '#84584E', '#D57FBE', '#BDBC45', '#56BBCC']      
+    for i in range(pca_loading.shape[1]):
+        plt.plot(pca_loading.iloc[:, i], 
+                 color = colors[i],
+                 label = pca_loading.columns[i],
+                 alpha = 0.8)
+        
+        plt.axvspan(4, 8, color = 'grey', alpha = 0.01)
+        plt.axvspan(13, 30, color = 'grey', alpha = 0.01)
+        plt.axvspan(60, 90, color = 'grey', alpha = 0.01)
+
+    plt.legend()
+    plt.ylabel('loadings')
+    plt.xlabel('Frequency (Hz)')
+    plt.title('top PC loadings')
+
+def plot_variance(df_ratios):
+    df_cum = np.cumsum(df_ratios)
+    title = 'PC cumulative variance explained'
+    xlabel = 'principal components'
+    ylabel = '% explained variance'
+    
+    if df_ratios.ndim == 1:
+        plt.figure()
+        plt.plot(df_cum)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        
+    else:
+        ncols = math.ceil(df_ratios.shape[1]/2) 
+        
+        fig, axs = plt.subplots(nrows = 2, ncols = ncols, figsize=(5*ncols, 10))
+        plt.rcParams.update({'font.size': 16})    
+        plt.setp(axs[-1, :], xlabel = xlabel)
+        plt.setp(axs[:, 0], ylabel = ylabel)
+        
+        fig.suptitle(title)
+        
+        ymin = df_cum.min().min() - 0.01
+        ymax = math.ceil(df_cum.max().max())
+        
+        
+        for i in range(df_ratios.shape[1]):  
+          ax = fig.get_axes()[i]
+          ax.set_ylim([ymin, ymax])
+          ax.set_title(df_ratios.columns[i])
+          ax.plot(df_cum.index.values,
+                  df_cum.iloc[:, i],
+                  marker = 'o')
+    pass    
+    
+def plot_pcs_symptoms(df_pcat_ch, df_norm, npcs, feature_key, data_dir):
+    targets = df_pcat_ch.T.columns
+    std_thresh = 10
+    scaler_type = 'minmax'
+    
+    df_pcat_norm = scale_data(df_pcat_ch.T, targets, std_thresh, scaler_type)
+    
+    for i in range(npcs):    
+        pc = i+1
+
+        dfl_top_pcs = {}
+
+        dfl_top_pcs['pkg_dk'] = pd.concat([df_pcat_norm.iloc[:, pc-1:pc], df_norm.loc[:, 'pkg_dk']], axis = 1)
+        dfl_top_pcs['pkg_bk'] = pd.concat([df_pcat_norm.iloc[:, pc-1:pc], df_norm.loc[:, 'pkg_bk']], axis = 1)
+        dfl_top_pcs['pkg_tremor'] = pd.concat([df_pcat_norm.iloc[:, pc-1:pc], df_norm.loc[:, 'pkg_tremor']], axis = 1)    
+        
+        plot_timeseries(dfl_top_pcs, data_dir, feature_key, 'samples')
+    pass
     
 def compute_spectra_stats(df, feature_key):
     [df_psd, contacts, frequencies] = get_psd(df, feature_key)
@@ -532,13 +821,15 @@ def train_val_test_split(X, y, test_ratio, shuffle=True):
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 def compute_correlation(df, feature_key, target):
-    if 'apple' in target:
-        addl = 'min1_'
-    if 'pkg' in target:
-        addl = 'min2_'
-        
-    feature_key_addl = addl + feature_key 
-    feature_i = [j for j, s in enumerate(df.columns) if feature_key_addl in s]    
+
+    if 'min' in df.columns:
+        if 'apple' in target:
+            feature_key = 'min1'
+        elif 'pkg' in target:
+            feature_key = 'min2'
+    
+    feature_i = [j for j, s in enumerate(df.columns) if feature_key in s]    
+    
 
     df = df.dropna()
     X = df.iloc[:, feature_i]
@@ -550,7 +841,7 @@ def compute_correlation(df, feature_key, target):
         
     return df_corrs
 
-def c2dto3d(df, contacts, frequencies, description):
+def c2dto3d(df, contacts, features, description):
     dim = len(contacts)
     df_3d = np.array(np.hsplit(df, dim))
                
@@ -559,7 +850,7 @@ def c2dto3d(df, contacts, frequencies, description):
                       coords = dict(
                           contact=contacts,
                           measure=df.index.values,
-                          feature=frequencies
+                          feature=features
                           ),
                       attrs=dict(description=description),
                       )
@@ -595,8 +886,17 @@ def c2dto4d(df, contacts, frequencies, description):
     return da        
     
 def compute_correlations(df, feature_key, target_list):
-    contacts = get_contacts(df.columns)
-    frequencies = get_frequencies(df.columns)
+    if '+' in df.columns.values[0]:
+        contacts = get_contacts(df.columns)
+        features = get_frequencies(df.columns)
+
+    elif 'pc' in df.columns.values[0]:
+        contacts = ['combined_channels']       
+        feature_i = [j for j, s in enumerate(df.columns) if feature_key in s]    
+        features_init = df.columns[feature_i].values
+        features_list = [sub.replace('pc', '') for sub in list(features_init)]
+        features = np.array(features_list).astype(int)
+        
     targets = list(set(target_list) & set(df.columns))
     
     da = xr.DataArray(
@@ -605,7 +905,7 @@ def compute_correlations(df, feature_key, target_list):
                           target=targets,
                           contact=contacts,
                           measure=['r', 'r_pval'],
-                          feature=frequencies
+                          feature=features
                           ),
                       attrs=dict(description='Pearson r test'),
                       )
@@ -615,7 +915,7 @@ def compute_correlations(df, feature_key, target_list):
         print_loop(i, len(targets), 'correlating', target)
         df_corrs = compute_correlation(df, feature_key, target)
         description = 'Pearsonr for ' + target
-        df_corrs_3d = c2dto3d(df_corrs, contacts, frequencies, description)
+        df_corrs_3d = c2dto3d(df_corrs, contacts, features, description)
         da.loc[dict(target=target)] = df_corrs_3d
         
     return da
@@ -687,6 +987,8 @@ def plot_psds(da, measure, out_gp, filename, feature_key):
     
 def plot_pca(da, measure, out_gp, filename, feature_key):       
     dirname = os.path.basename(out_gp)
+    da = da.where(da.feature <= 100, drop = True)
+
     contacts = da['contact'].values
     pcs = da['pc'].values
     num_plots = len(contacts)
@@ -696,16 +998,20 @@ def plot_pca(da, measure, out_gp, filename, feature_key):
     fig, axs = plt.subplots(nrows = 2, ncols = ncols, figsize=(5*ncols, 15))
     plt.rcParams.update({'font.size': 16})    
     plt.setp(axs[-1, :], xlabel = 'Frequencies (Hz)')
-    plt.setp(axs[:, 0], ylabel = 'component values')
+    plt.setp(axs[:, 0], ylabel = 'PC loadings')
     
-    fig.suptitle(dirname + ' ' + 'top PCs ' + measure + ' domain')
+    fig.suptitle(dirname + ' ' + 'PCA loadings')
     
     colors = ['#3976AF', '#F08536', '#519D3E', '#C63A32', '#8D6BB8', '#84584E', '#D57FBE', '#BDBC45', '#56BBCC']      
+
+    ymin = da.values.min()
+    ymax = da.values.max()
 
     for i in range(len(contacts)):  
         contact = contacts[i]
         ax = fig.get_axes()[i]
         ax.set_xlim([0, 100])
+        ax.set_ylim([ymin, ymax])
 
         ax.axhline(y=0, color = 'grey')
         ax.axvspan(4, 8, color = 'grey', alpha = 0.1)
@@ -735,7 +1041,148 @@ def plot_pca(da, measure, out_gp, filename, feature_key):
     make_dir(out_gp, 'plots')
     out_dir= make_dir(os.path.join(out_gp, 'plots'), feature_key)
     fig.savefig(os.path.join(out_dir, filename))
+
+def plot_pcs(da):
+    da = da.where(da.feature <= 100, drop = True)
     
+    channels = da['contact'].values
+    pcs = da['pc'].values
+    
+    npcs = len(pcs)
+    nchannels = len(channels)
+    
+    colors = ['#3976AF', '#F08536', '#519D3E', '#C63A32', '#8D6BB8', 
+              '#84584E', '#D57FBE', '#BDBC45', '#56BBCC']  
+    
+    fig, axs = plt.subplots(nrows = npcs, ncols = nchannels, 
+                            figsize=(5*nchannels, 15),
+                            constrained_layout = True)
+    
+    plt.rcParams.update({'font.size': 16})    
+    plt.setp(axs[-1, :], xlabel = 'Frequencies (Hz)')
+    plt.setp(axs[:, 0], ylabel = 'PC loadings')
+
+    fig.suptitle('Individual PC loadings')
+
+    ymin = da.values.min()
+    ymax = da.values.max()
+    
+    for i_ch in range(nchannels):
+        channel = channels[i_ch]
+        for i_pc in range(npcs):
+            pc = pcs[i_pc]
+
+            ax = axs[i_pc, i_ch]
+            ax.set_xlim([0, 100])
+            ax.set_ylim([ymin, 10])
+            ax.axhline(y=0, color = 'grey')
+            ax.axvspan(4, 8, color = 'grey', alpha = 0.1)
+            ax.axvspan(13, 30, color = 'grey', alpha = 0.1)
+            ax.axvspan(60, 90, color = 'grey', alpha = 0.1)
+
+            ax.set_title(channel)         
+
+            df = pd.DataFrame(da.sel(contact = channel, 
+                                     pc = pc).values.T, 
+                              columns = [channel],
+                              index = da.feature)
+            
+            ax.plot(df, color = colors[i_pc], label = pc)
+            ax.legend()
+
+    pass    
+
+def plot_spectra_df(df, npcs):
+
+    pc_list = df.index.values[0:npcs]
+    
+    for i in range(len(pc_list)):
+        pc = pc_list[i]
+        plt.plot(df.loc[pc, :], label = pc)
+
+    plt.rcParams.update({'font.size': 16})  
+
+    plt.axvspan(4, 8, color = 'grey', alpha = 0.1)
+    plt.axvspan(13, 30, color = 'grey', alpha = 0.1)
+    plt.axvspan(60, 90, color = 'grey', alpha = 0.1)
+    
+    plt.xlim(0, 100)
+    
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('PC loadings')
+    plt.legend()
+
+    pass
+
+def plot_pcs_clustered(df_pca, df_targets):
+    targets = df_targets.columns.values
+    pcs = df_pca.columns.values
+    combos_list = list(combinations(pcs, 2))
+
+    if 'channel' in df_targets.columns:
+        channel_labels = df_targets.channel.unique()
+        colors = {channel_labels[0]: 'tab:blue',
+                  channel_labels[1]: 'tab:orange',
+                  channel_labels[2]: 'tab:red',
+                  channel_labels[3]: 'tab:green'}
+
+    for i_t in range(len(targets)):
+        target = targets[i_t]
+        
+        df = pd.concat([df_pca, df_targets.loc[:, target]], axis = 1).dropna()
+        
+        nplots = len(combos_list)
+        ncols = math.ceil(nplots/2)
+        nrows = 2
+        
+        fig, axs = plt.subplots(nrows = nrows, ncols = ncols, 
+                                figsize=(25, 7), constrained_layout = True)
+        
+        fig.suptitle('clustered time PCs: ' + target)
+        plt.rcParams.update({'font.size': 16})  
+
+        for i_c in range(nplots):
+            ax = fig.get_axes()[i_c]
+            
+            xlabel = combos_list[i_c][0]
+            ylabel = combos_list[i_c][1]
+            ax.set_ylabel(ylabel)
+            ax.set_xlabel(xlabel)
+            
+            alpha = 0.5
+            cmap = 'viridis'
+            if type(df[target].values[0]) == str:                                 
+                ax.scatter(df[xlabel].values, df[ylabel].values, edgecolors = 'none',
+                           c = df[target].map(colors), alpha = alpha)
+                     
+            else:
+                sc = ax.scatter(df[xlabel].values, df[ylabel].values, edgecolors = 'none',
+                       c = df[target], cmap = cmap , alpha = alpha)
+    
+        if 'channel' in df_targets.columns:
+        # add a legend                
+            handles = [Line2D([0], [0], marker='o', color='w', markerfacecolor=v, label=k, markersize=8) for k, v in colors.items()]
+            ax.legend(title='color', handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        else:
+            cbar = fig.colorbar(sc, ax = ax, orientation = "vertical", shrink = 0.5)
+            cbar.ax.get_yaxis().labelpad = 15
+
+            cbar.ax.set_ylabel(target + ' scores', rotation = 270)
+    pass
+
+def plot_pcs_clustered_severity(df_pcat_ch_concat, df_channels, df_norm, targets):
+    for i in range(len(targets)):
+        target = targets[i]
+        categories = df_norm[target].dropna().unique()
+        for j in range(len(categories)):
+            category = categories[j]
+            timestamp_list = df_norm[target][df_norm[target] == category].index
+            plot_pcs_clustered(df_pcat_ch_concat.T.loc[timestamp_list, :].iloc[:, 0:5], 
+                            df_channels.loc[timestamp_list, :])
+            plt.title(target + " == " + str(category))
+    
+
 def plot_corrs(da, measure, out_gp, filename, feature_key):
     #dims = da.coords.dims
     dirname = os.path.basename(out_gp)
@@ -746,7 +1193,10 @@ def plot_corrs(da, measure, out_gp, filename, feature_key):
     nrows = 2
     fig, axs = plt.subplots(nrows = nrows, ncols = ncols, figsize=(5*ncols, 15))
     plt.rcParams.update({'font.size': 16})  
-    xlabel = 'Frequencies (Hz)'
+    if 'pc' in feature_key:
+        xlabel = 'PC'
+    else:
+        xlabel = 'Frequencies (Hz)'
     ylabel = 'Pearson ' + measure
     if num_plots <= nrows:
         plt.setp(axs[-1], xlabel = xlabel)
@@ -763,11 +1213,13 @@ def plot_corrs(da, measure, out_gp, filename, feature_key):
         ax = fig.get_axes()[i]
 
         ax.set_ylim([-1, 1])
-        ax.set_xlim([0, 100])
         ax.axhline(y=0, color = 'grey')
-        ax.axvspan(4, 8, color = 'grey', alpha = 0.1)
-        ax.axvspan(13, 30, color = 'grey', alpha = 0.1)
-        ax.axvspan(60, 90, color = 'grey', alpha = 0.1)
+
+        if 'pc' not in feature_key:
+            ax.set_xlim([0, 100])
+            ax.axvspan(4, 8, color = 'grey', alpha = 0.1)
+            ax.axvspan(13, 30, color = 'grey', alpha = 0.1)
+            ax.axvspan(60, 90, color = 'grey', alpha = 0.1)
         ax.set_title(target)
 
         df = pd.DataFrame(da.sel(target = target, 
@@ -935,7 +1387,7 @@ def get_top_sigcorrs(da_pearsonr, abs_val=False):
         if 'tremor' in target:
             freq_thresh = 2
         cols_keep = df_sigcorr.columns[df_sigcorr.columns.astype(float) >= freq_thresh]
-        df_sigcorr = df_sigcorr.iloc[:, cols_keep]
+        df_sigcorr = df_sigcorr.loc[:, cols_keep] #MO edit: iloc to loc 04/15
 
         df_out['r'] = df_sigcorr.T.max()
         df_out['r_pval'] = np.diag(df_pval[df_sigcorr.T.idxmax()])
@@ -1040,8 +1492,18 @@ def compute_top_ccfs(dfl_top_ts):
 
     return df_collection
 
-def compute_lr(X_train, y_train, X_test, y_test):
-    model = LinearRegression()
+def compute_model(X_train, y_train, X_test, y_test, model):
+    cv = RepeatedKFold(n_splits=10, n_repeats=3, random_state=1)
+
+    if model == 'lr':
+        model = LinearRegression()
+    elif model == 'lasso':
+        model = LassoCV(alphas = np.arange(0, 1, 0.01), cv = cv, n_jobs = -1)
+        
+        #print('alpha: %f' % model.alphas_)
+    else:
+        raise ValueError('Incorrect model input: model options are `lr` or `lasso`')
+
     model.fit(X_train, y_train)
     prediction = model.predict(X_test)
 
@@ -1052,7 +1514,47 @@ def compute_lr(X_train, y_train, X_test, y_test):
   
     return result
 
-def run_lr_model(X, y_all, description):
+def compute_metrics_cv(X, y, target, model, alpha = 0.6):
+    if model == 'lr':
+        model = LinearRegression()
+    elif model == 'lasso':
+        model = Lasso(alpha = alpha)
+
+    cv = RepeatedKFold(n_splits=10, n_repeats=3, random_state=1)
+    
+    metrics = pd.DataFrame(columns = ['mae', 'rmse', 'r2'], index = [target])
+        
+    metrics.mae = abs(np.mean(cross_val_score(model, 
+                                  X.to_numpy(), 
+                                  y, 
+                                  scoring = 'neg_mean_absolute_error', 
+                                  cv=cv, 
+                                  n_jobs=-1)))
+    
+    metrics.rmse = abs(np.mean(cross_val_score(model, 
+                                       X.to_numpy(), 
+                                       y, 
+                                       scoring = 'neg_root_mean_squared_error', 
+                                       cv=cv, 
+                                       n_jobs=-1)))
+    
+    metrics.r2 = np.mean(cross_val_score(model, 
+                                 X.to_numpy(), 
+                                 y, 
+                                 scoring = 'r2', 
+                                 cv=cv, n_jobs=-1))
+
+    return metrics
+
+def match_dims(X, y_all):
+    indx_nan = y_all[y_all.isnull().any(axis=1)].index
+    if len(indx_nan) > 0:
+        X = X.drop(indx_nan, axis = 0)
+        y_all = y_all.drop(indx_nan, axis = 0)
+    return [X, y_all]
+
+def run_baseline_model(X, y_all, model, description, shuffle):
+    [X, y_all] = match_dims(X, y_all)
     if (y_all.ndim == 1):
         targets = ['apple_tremor']
     elif (isinstance(y_all, pd.Series)):
@@ -1069,9 +1571,11 @@ def run_lr_model(X, y_all, description):
             y = y_all
         else:
             y = y_all.loc[:, target].to_numpy()
-        [X_train, X_val, X_test, y_train, y_val, y_test] = train_val_test_split(X, y, 0.2, shuffle=False)
-        df_prediction = compute_lr(X_train, y_train, X_test, y_test)
+        [X_train, X_val, X_test, y_train, y_val, y_test] = train_val_test_split(X, y, 0.2, shuffle)
+        df_prediction = compute_model(X_train, y_train, X_test, y_test, model)
         df_prediction.columns = ['value', 'prediction']
+        df_prediction.index = X_test.index
+        df_prediction.index.name = 'measure'
         df_metrics.loc[target, :] = calculate_metrics(df_prediction)
         dfl_predictions.append(df_prediction)
     
@@ -1081,26 +1585,90 @@ def run_lr_model(X, y_all, description):
                       dims = ['target', 'measure', 'value'], 
                       coords = dict(
                           target = targets,
-                          #measure=range(0, df_multidim.shape[1]),
+                          measure=df_prediction.index,
                           value=df_prediction.columns
                           ),
                       attrs=dict(description=description),
                       )
     return [da, df_metrics]
 
+def run_baseline_model_cv(X, y_all, model, alpha = 0.6):
+    [X, y_all] = match_dims(X, y_all)
+    if (y_all.ndim == 1):
+        targets = ['apple_tremor']
+    elif (isinstance(y_all, pd.Series)):
+        targets = [y_all.name]
+    else:
+        targets = y_all.columns
+
+    df_metrics = pd.DataFrame(columns = ['mae', 'rmse', 'r2'], index = targets)
+    for i in range(len(targets)):
+        target = targets[i]
+        if y_all.ndim == 1:
+            y = y_all
+        elif isinstance(y_all, pd.Series):
+            y = y_all
+        else:
+            y = y_all.loc[:, target].to_numpy()
+        df_metrics.loc[target, :] = compute_metrics_cv(X, y, target, model, alpha).to_numpy()
+    
+    return df_metrics
+
+def compute_alpha_curve(X, y_all, upper_alpha_thresh, nalpha):
+    alpha_vals = np.linspace(0.001, upper_alpha_thresh, num=nalpha)
+    
+    alpha_curve = pd.DataFrame(columns = y_all.columns.values,
+                      index = alpha_vals)
+    
+    for i in range(nalpha):
+        print(i)
+        alpha_val = alpha_vals[i]
+        stats = run_baseline_model_cv(X, y_all, 'lasso', alpha_val)
+        alpha_curve.loc[alpha_val, :] = stats.loc[:, 'r2'].T
+    
+    alpha_curve.index.name  = 'alpha_values'
+    
+    return alpha_curve
+    
+def plot_alpha_curve(alpha_curve):
+    
+    measures = alpha_curve.columns.values
+    for i in range(len(measures)):
+        measure = measures[i]
+        plt.plot(alpha_curve.loc[:, measure], label = measure)
+        plt.ylabel('r2')
+        plt.xlabel('alpha values')
+        plt.title('alpha-accuracy curve')
+
+    plt.legend()
+    
 def calculate_metrics(df):
     return {'mae' : mean_absolute_error(df.value, df.prediction),
             'rmse' : mean_squared_error(df.value, df.prediction) ** 0.5,
             'r2' : r2_score(df.value, df.prediction)}   
 
-def run_blstm(X, y, target):    
-    X_train, X_val, X_test, y_train, y_val, y_test = train_val_test_split(X, y, 0.2, shuffle=False)
+def compare_model_metrics(ml_metrics, baseline_metrics, target):
+    ml_arr = np.array(list(ml_metrics.items())).T
+    bl_arr = baseline_metrics.loc[target, :].to_numpy().reshape(-1, 1)
+    table = pd.DataFrame(data = np.concatenate((bl_arr, ml_arr[1].reshape(-1, 1)), axis = 1),
+                         columns = ['baseline_model', 'ml_model'],
+                         index = [ml_arr[0]])
+    return table
+
+def run_blstm(X, y_all, target, baseline_model, description, shuffle, model_inputs): 
+    [X, y_all] = match_dims(X, y_all)
+    y = y_all.loc[:, target].to_numpy()
+    X_train, X_val, X_test, y_train, y_val, y_test = train_val_test_split(X, 
+                                                                          y, 
+                                                                          0.2, 
+                                                                          shuffle=shuffle)
 
     scaler = get_scaler('minmax')
     X_train_arr = scaler.fit_transform(X_train)
     X_val_arr = scaler.transform(X_val)
     X_test_arr = scaler.transform(X_test)
     
+    y_train = scaler.fit_transform(y_train.reshape(-1, 1))
     y_train_arr = scaler.fit_transform(y_train.reshape(-1, 1))
     y_val_arr = scaler.transform(y_val.reshape(-1, 1))
     y_test_arr = scaler.transform(y_test.reshape(-1, 1))
@@ -1118,62 +1686,66 @@ def run_blstm(X, y, target):
     val = TensorDataset(val_features, val_targets)
     test = TensorDataset(test_features, test_targets)
     
-    train_loader = DataLoader(train, batch_size=batch_size, shuffle=False, drop_last=True)
-    val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, drop_last=True)
-    test_loader = DataLoader(test, batch_size=batch_size, shuffle=False, drop_last=True)
-    test_loader_one = DataLoader(test, batch_size=1, shuffle=False, drop_last=True)
+    train_loader = DataLoader(train, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+    val_loader = DataLoader(val, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+    test_loader = DataLoader(test, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+    test_loader_one = DataLoader(test, batch_size=1, shuffle=shuffle, drop_last=True)
 
-    input_dim = len(X_train.columns)
-    output_dim = 1
-    hidden_dim = 64
-    layer_dim = 3
     batch_size = 64
-    dropout = 0.2
-    n_epochs = 100
-    learning_rate = 1e-3
-    weight_decay = 1e-6
-    
-    model_params = {'input_dim': input_dim,
-                    'hidden_dim' : hidden_dim,
-                    'layer_dim' : layer_dim,
-                    'output_dim' : output_dim,
-                    'dropout_prob' : dropout}
+    model_params = {'input_dim': len(X_train.columns),
+                    'hidden_dim' : model_inputs['hidden_dim'],
+                    'layer_dim' : model_inputs['layer_dim'],
+                    'output_dim' : model_inputs['output_dim'],
+                    'dropout_prob' : model_inputs['dropout_prob']}
     
     model = get_model('lstm', model_params)
     
     loss_fn = torch.nn.MSELoss(reduction="mean")
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = optim.Adam(model.parameters(), lr=model_inputs['learning_rate'], 
+                           weight_decay=model_inputs['weight_decay'])
+    
     opt = Optimization(model=model, loss_fn=loss_fn, optimizer=optimizer)
-    opt.train(train_loader, val_loader, batch_size=batch_size, n_epochs=n_epochs, n_features=input_dim)
-    opt.plot_losses()
+    opt.train(train_loader, val_loader, batch_size=batch_size, 
+              n_epochs=model_inputs['n_epochs'], n_features=model_params['input_dim'])
+    fig_losses = opt.plot_losses()
     
-    predictions, values = opt.evaluate(test_loader_one, batch_size=1, n_features=input_dim)
+    predictions, values = opt.evaluate(test_loader_one, batch_size=1, 
+                                       n_features=model_params['input_dim'])
     
-    df_result = format_predictions(predictions, values, X_test, scaler)
-    result_metrics = calculate_metrics(df_result)
+    ml_pred = format_predictions(predictions, values, X_test, scaler)
+    ml_metrics = calculate_metrics(ml_pred)
     
-    df_baseline = run_lr_model(X, y, target)
-    #df_baseline['value'] = df_baseline[target]
-    baseline_metrics = calculate_metrics(df_baseline)
+    [baseline_preds, baseline_metrics] = run_baseline_model(X, y_all, 
+                                                            baseline_model, 
+                                                            description, 
+                                                            shuffle)
+    
+    baseline_pred = pd.DataFrame(baseline_preds.sel(target=target).data,
+                                 columns = baseline_preds.value.to_numpy(),
+                                 index = baseline_preds['measure'].data).sort_index()
 
-    fig = plot_predictions_MO(df_result, df_baseline)
+    fig_preds = plot_predictions_MO(ml_pred, baseline_pred, target)
     
-    return [result_metrics, baseline_metrics, fig]
+    metrics = compare_model_metrics(ml_metrics, baseline_metrics, target)
+    print(metrics)
+    return metrics
 
-def plot_predictions_MO(df_result, df_baseline):
-    plt.close()
+def plot_predictions_MO(ml_pred, baseline_pred, target):
+    #plt.close()
+    plt.figure()
     plt.rcParams["figure.figsize"] = (15,5)
 
-    plt.plot(df_result.index, df_result.value, color = 'gray', label = 'apple_tremor')
-    plt.plot(df_baseline.index, df_baseline.prediction, alpha  = 0.5, label = 'linear regression')
-    plt.plot(df_result.index, df_result.prediction, alpha = 0.5, label = 'ML model')
+    plt.plot(ml_pred.index, ml_pred.value, color = 'gray', label = target)
+    plt.plot(baseline_pred.index, baseline_pred.prediction, alpha  = 0.5, label = 'linear regression')
+    plt.plot(ml_pred.index, ml_pred.prediction, alpha = 0.5, label = 'ML model')
     plt.title('Model comparison')
 
 
     plt.legend(ncol = 1, loc = 'upper right')
     plt.ylabel('scores (normalized)')
     plt.xlabel('Time')
+    plt.show()
 
 class RNNModel(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, layer_dim, output_dim, dropout_prob):
@@ -1379,12 +1951,3 @@ def format_predictions(predictions, values, df_test, scaler):
     df_result = df_result.sort_index()
     df_result = inverse_transform(scaler, df_result, [["value", "prediction"]])
     return df_result
-
-
-
-
-
-
-
-
-        

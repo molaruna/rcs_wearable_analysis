@@ -4,7 +4,8 @@ This code uses neural data that have been preprocessed using [rcs_lfp_analysis r
 into overlaid power spectra (details in [readme](https://github.com/molaruna/rcs_lfp_analysis/blob/main/README.md)) to continuously decode motor signs using spectral features from chronic human brain recordings collected using the Summit RC+S system, in addition to sensor wearable measures of motor signs. 
 
 ## Getting started
-This code uses Python 3.8.3
+This code uses Python 3.8.3. Currently, to run this analysis, download the [script]() and play around with the inputs.
+
 
 
 ## Data
